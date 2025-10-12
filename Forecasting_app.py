@@ -143,7 +143,13 @@ with st.expander("Accuracy snapshot (last 3 months, training data)", expanded=Fa
     st.caption(f"Months: {', '.join(snap['months'])} • View: {snap_view}")
 
 
-st.subheader(v["title"])
+# Header works for both levels
+if view.startswith("Product Demand") and level == "Itemcodes (allocated)":
+    page_title = f"Product Demand — Itemcodes (allocated) | latest/next: {exports['latest_actual_month']} → {exports['next_forecast_month']}"
+else:
+    page_title = v["title"]
+st.subheader(page_title)
+
 
 # --- Next-month forecast (table) ---
 if view.startswith("Product Demand") and level == "Itemcodes (allocated)":
