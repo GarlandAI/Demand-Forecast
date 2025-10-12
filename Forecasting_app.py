@@ -8,8 +8,11 @@ from notebook_exports import (
     prepare_from_excel, get_items_view, get_customers_view,
     list_item_groups, list_customer_groups,
     series_history, series_next_forecast,
-    accuracy_snapshot
+    accuracy_snapshot,
+    get_itemcodes_allocated_view,  
 )
+
+
 
 
 REQUIRED_BASE_COLS = [
@@ -64,6 +67,20 @@ mode = st.sidebar.radio(
     help="ML uses Holt-Winters where it beats baseline; calibrated scales ML totals to baseline."
 )
 
+# how many months to look back for item mix when allocating group → itemcodes
+ALLOC_LOOKBACK_MONTHS = 3
+
+# show level choice only for the Product Demand page
+level = None
+if view.startswith("Product Demand"):
+    level = st.sidebar.radio(
+        "Product level",
+        ["Groups", "Itemcodes (allocated)"],
+        index=0,
+        help="Groups = product families (most accurate). Itemcodes (allocated) = split by recent mix shares."
+    )
+
+
 if st.sidebar.button("Clear cache"):
     st.cache_data.clear()
     st.success("Cache cleared. Re-upload the Excel file.")
@@ -97,9 +114,15 @@ next_m = exports["next_forecast_month"]
 
 # --- Route to the right view getter ---
 if view.startswith("Product Demand"):
-    v = get_items_view(source=mode, exports=exports)
+    if level == "Itemcodes (allocated)":
+        v_alloc = get_itemcodes_allocated_view(
+            mode, exports, lookback_months=ALLOC_LOOKBACK_MONTHS
+        )
+    else:
+        v = get_items_view(mode, exports)
 else:
-    v = get_customers_view(source=mode, exports=exports)
+    v = get_customers_view(mode, exports)
+
 
 # --- Header stats ---
 lcol, rcol = st.columns([1,1])
@@ -122,15 +145,48 @@ with st.expander("Accuracy snapshot (last 3 months, training data)", expanded=Fa
 
 st.subheader(v["title"])
 
-# --- Next-month forecast (tidy long) ---
-st.markdown("**Next-month forecast table**")
-next_tbl = v["next_forecast_long"].copy()
-st.dataframe(next_tbl, use_container_width=True)
+# --- Next-month forecast (table) ---
+if view.startswith("Product Demand") and level == "Itemcodes (allocated)":
+    st.markdown("**Next-month forecast (Itemcodes — allocated)**")
 
-total = float(next_tbl["Forecast_qty"].sum())
-st.markdown(f"**Total forecasted quantity (next month):** {total:,.0f}")
+    next_tbl = v_alloc["next_forecast_long"].copy()
+    st.dataframe(next_tbl, use_container_width=True)
 
-st.caption(f"Mode: {v.get('source_used','baseline')} • Rows: {len(next_tbl)} • Total: {total:,.0f}")
+    total = float(next_tbl["Forecast_qty"].sum())
+    st.markdown(f"**Total forecasted quantity (next month):** {total:,.0f}")
+    st.caption(
+        f"Mode: {v_alloc.get('source_used','baseline')}+allocated • "
+        f"Rows: {len(next_tbl)} • Total: {total:,.0f} • "
+        f"Lookback: {ALLOC_LOOKBACK_MONTHS}m shares"
+    )
+
+    # CSV download for per-Itemcode
+    csv = next_tbl.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download per-Itemcode forecast (CSV)",
+        data=csv,
+        file_name=f"forecast_itemcodes_{v_alloc['next_month']}_{mode}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # Optional: show the allocation shares used
+    with st.expander("Show allocation shares (by Group → Itemcode)", expanded=False):
+        st.dataframe(v_alloc["shares_table"], use_container_width=True)
+        st.caption("Share basis: 3m / 12m / lifetime / equal")
+
+    st.stop()  # hide group-only sections below when viewing Itemcodes (allocated)
+
+else:
+    # Existing rendering for Groups or Customers
+    st.markdown("**Next-month forecast table**")
+    next_tbl = v["next_forecast_long"].copy()
+    st.dataframe(next_tbl, use_container_width=True)
+    total = float(next_tbl["Forecast_qty"].sum())
+    st.markdown(f"**Total forecasted quantity (next month):** {total:,.0f}")
+    st.caption(f"Mode: {v.get('source_used','baseline')} • Rows: {len(next_tbl)} • Total: {total:,.0f}")
+
+    # (keep your existing CSV download here if you already had one)
 
 
 # --- Training history (wide) ---

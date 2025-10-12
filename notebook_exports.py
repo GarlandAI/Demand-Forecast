@@ -397,6 +397,8 @@ def prepare_from_excel(file_path):
     fact = norm["FACT"]
     bundle = build_export_bundle_from_fact(fact)
     bundle = _attach_ml_and_calibration(bundle)
+    bundle["fact"] = fact[["Month_ym", "Group", "Itemcode", "Quantity"]].copy()
+
     return {
         "sheets": sheets,
         "fact": fact,
@@ -519,6 +521,164 @@ def accuracy_snapshot(exports, view: str, top_k_customers: int = 30):
         }
     else:
         raise ValueError("view must be 'items' or 'customers'")
+
+
+# ---------- Itemcode allocation (top-down from Group forecast) ----------
+
+def _all_months_from_exports(exports) -> list[str]:
+    """Chronological list of YYYY-MM months from the item-group training table."""
+    idx = exports["opt1_train_wide"].index
+    return [str(p) for p in idx]  # already PeriodIndex('M') in our prep
+
+def _item_desc_map_from_exports(exports):
+    """
+    Try to build {Itemcode -> Item Description} from any actuals we have.
+    Returns a pandas Series or None if not available.
+    """
+    # Prefer a full actuals table if present
+    for key in ["base_actuals", "actuals", "base"]:
+        if key in exports:
+            df = exports[key]
+            if {"Itemcode", "Item Description"}.issubset(df.columns):
+                m = (df.dropna(subset=["Itemcode"])
+                       .drop_duplicates(subset=["Itemcode"], keep="last")
+                       .set_index("Itemcode")["Item Description"])
+                return m
+    # Fallback: if FACT happens to carry description in future
+    if "fact" in exports and "Item Description" in exports["fact"].columns:
+        df = exports["fact"]
+        m = (df.dropna(subset=["Itemcode"])
+               .drop_duplicates(subset=["Itemcode"], keep="last")
+               .set_index("Itemcode")["Item Description"])
+        return m
+    return None
+
+def _compute_window_shares(fact: pd.DataFrame, months: list[str]) -> pd.DataFrame:
+    """
+    Compute shares per (Group, Itemcode) within a month window.
+    Returns columns: Group, Itemcode, share
+    """
+    f = fact.loc[fact["Month_ym"].isin(months), ["Group", "Itemcode", "Quantity"]].copy()
+    grp_item = f.groupby(["Group", "Itemcode"], as_index=False)["Quantity"].sum()
+    grp_tot = grp_item.groupby("Group", as_index=False)["Quantity"].sum().rename(columns={"Quantity": "GroupTotal"})
+    m = grp_item.merge(grp_tot, on="Group", how="left")
+    m["share"] = m["Quantity"] / m["GroupTotal"]
+    return m[["Group", "Itemcode", "share"]]
+
+def _complete_group_item_grid(fact: pd.DataFrame) -> pd.DataFrame:
+    """All (Group, Itemcode) pairs that ever appeared in actuals."""
+    pairs = fact[["Group", "Itemcode"]].drop_duplicates().reset_index(drop=True)
+    return pairs
+
+def _assemble_shares_with_fallbacks(exports, lookback_months: int = 3) -> pd.DataFrame:
+    """
+    Build final shares with fallbacks: last K months -> last 12 months -> lifetime -> equal.
+    Returns: Group, Itemcode, share, basis
+    """
+    if "fact" not in exports:
+        raise ValueError("exports must include 'fact' with Month_ym, Group, Itemcode, Quantity.")
+    fact = exports["fact"].copy()
+    all_months = _all_months_from_exports(exports)
+    # windows
+    win_k   = all_months[-lookback_months:] if lookback_months and len(all_months) >= lookback_months else all_months
+    win_12  = all_months[-12:] if len(all_months) >= 12 else all_months
+    win_all = all_months
+
+    base_grid = _complete_group_item_grid(fact)
+
+    s_k   = _compute_window_shares(fact, win_k).rename(columns={"share": "share_k"})
+    s_12  = _compute_window_shares(fact, win_12).rename(columns={"share": "share_12"})
+    s_all = _compute_window_shares(fact, win_all).rename(columns={"share": "share_all"})
+
+    m = (base_grid
+         .merge(s_k,   on=["Group", "Itemcode"], how="left")
+         .merge(s_12,  on=["Group", "Itemcode"], how="left")
+         .merge(s_all, on=["Group", "Itemcode"], how="left"))
+
+    # choose first available share and record basis
+    m["share"] = m["share_k"].where(m["share_k"].notna(), m["share_12"].where(m["share_12"].notna(), m["share_all"]))
+    m["basis"] = pd.NA
+    m.loc[m["share_k"].notna(), "basis"] = f"{len(win_k)}m"
+    m.loc[m["basis"].isna() & m["share_12"].notna(), "basis"] = "12m"
+    m.loc[m["basis"].isna() & m["share_all"].notna(), "basis"] = "lifetime"
+
+    # equal split for any remaining null shares within a group
+    def _fill_equal(group_df: pd.DataFrame) -> pd.DataFrame:
+        if group_df["share"].notna().all():
+            # normalize tiny numeric drift to 1.0
+            s = group_df["share"].sum()
+            if s and abs(1.0 - float(s)) > 1e-6:
+                group_df["share"] = group_df["share"] / s
+            return group_df
+        mask_missing = group_df["share"].isna()
+        n_missing = int(mask_missing.sum())
+        if n_missing == 0:
+            return group_df
+        remainder = 1.0 - float(group_df.loc[~mask_missing, "share"].sum(skipna=True))
+        eq = max(remainder, 0.0) / n_missing if n_missing > 0 else 0.0
+        group_df.loc[mask_missing, "share"] = eq
+        group_df.loc[mask_missing, "basis"] = group_df.loc[mask_missing, "basis"].fillna("equal")
+        # final normalization to sum=1.0 (safety)
+        s = float(group_df["share"].sum())
+        if s > 0:
+            group_df["share"] = group_df["share"] / s
+        return group_df
+
+    m = m.groupby("Group", group_keys=False).apply(_fill_equal)
+    return m[["Group", "Itemcode", "share", "basis"]]
+
+def get_itemcodes_allocated_view(mode: str, exports, lookback_months: int = 3):
+    """
+    mode: 'baseline' | 'ml' | 'ml_calibrated'
+    Returns dict with:
+      - next_forecast_long: Month_ym, Group, Itemcode, Item Description(optional), Forecast_qty, Share_used, Basis, Source
+      - shares_table: Group, Itemcode, share, basis
+      - source_used: str
+      - next_month: str
+    """
+    mode = mode.lower()
+    if mode not in ("baseline", "ml", "ml_calibrated"):
+        raise ValueError("mode must be 'baseline', 'ml', or 'ml_calibrated'")
+
+    key_map = {
+        "baseline":      "opt1_next_baseline_long",
+        "ml":            "opt1_next_mixed_long",
+        "ml_calibrated": "opt1_next_ml_calibrated_long",
+    }
+    next_groups = exports[key_map[mode]].copy()
+    shares = _assemble_shares_with_fallbacks(exports, lookback_months=lookback_months)
+
+    # Merge: each group forecast spread to itemcodes via shares
+    alloc = shares.merge(next_groups[["Group", "Forecast_qty"]], on="Group", how="left", validate="many_to_one")
+    alloc["Forecast_qty"] = alloc["Forecast_qty"].fillna(0) * alloc["share"].fillna(0)
+
+    # Attach Month and optional description
+    next_m = exports["next_forecast_month"]
+    alloc.insert(0, "Month_ym", next_m)
+
+    desc_map = _item_desc_map_from_exports(exports)
+    if desc_map is not None:
+        alloc = alloc.merge(desc_map.rename("Item Description"), left_on="Itemcode", right_index=True, how="left")
+
+    # Clean columns
+    alloc = alloc.rename(columns={"share": "Share_used", "basis": "Basis"})
+    alloc["Source"] = f"{mode}+allocated"
+
+    # Order nicely
+    col_order = ["Month_ym", "Group", "Itemcode"]
+    if "Item Description" in alloc.columns:
+        col_order += ["Item Description"]
+    col_order += ["Forecast_qty", "Share_used", "Basis", "Source"]
+    alloc = alloc[col_order].sort_values(["Group", "Forecast_qty"], ascending=[True, False]).reset_index(drop=True)
+
+    return {
+        "next_forecast_long": alloc,
+        "shares_table": shares,
+        "source_used": mode,
+        "next_month": next_m,
+    }
+
+
 
 
 def get_items_view(source: str = "baseline", exports: Dict[str, pd.DataFrame] = None):
