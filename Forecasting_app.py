@@ -12,6 +12,10 @@ from notebook_exports import (
 )
 
 
+REQUIRED_BASE_COLS = [
+    "Delivery Date", "Month", "Quantity", "Itemcode", "Group", "Customer Group"
+]
+
 @st.cache_data(show_spinner=True, ttl=300)
 def _cached_prepare_from_excel(file_obj):
     # Streamlit gives a file-like object; pandas can read it directly
@@ -69,7 +73,24 @@ if excel_file is None:
     st.stop()
 
 # --- Prepare data (single call) ---
-prep = _cached_prepare_from_excel(excel_file)
+try:
+    prep = _cached_prepare_from_excel(excel_file)
+except Exception as e:
+    st.error(
+        "We couldn’t read this workbook. Please ensure it contains a sheet named "
+        "`Base` with these columns: "
+        "`Delivery Date`, `Month`, `Quantity`, `Itemcode`, `Group`, `Customer Group`."
+    )
+    with st.expander("Technical details"):
+        st.exception(e)
+    st.stop()
+
+base_cols = set(prep["base_actuals"].columns)
+missing = [c for c in REQUIRED_BASE_COLS if c not in base_cols]
+if missing:
+    st.error("Missing required columns in `Base`: " + ", ".join(missing))
+    st.stop()
+
 exports = prep["exports"]
 latest = exports["latest_actual_month"]
 next_m = exports["next_forecast_month"]
