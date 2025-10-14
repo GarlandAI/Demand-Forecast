@@ -1,0 +1,24 @@
+name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    # Runs every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the Streamlit App
+        run: |
+          # Replace with your Streamlit app's URL
+          STREAMLIT_URL="https://YOUR_STREAMLIT_APP_URL.streamlit.app/" 
+          
+          # Send a request to the URL
+          curl -s -o /dev/null -w "%{http_code}\n" $STREAMLIT_URL
+          
+          # Use sleep to wait a bit, just in case (optional)
+          sleep 10s
+          
+          echo "Streamlit app pinged successfully."
