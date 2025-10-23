@@ -67,6 +67,9 @@ mode = st.sidebar.radio(
     help="ML uses Holt-Winters where it beats baseline; calibrated scales ML totals to baseline."
 )
 
+use_wd = st.sidebar.toggle("Use Working Days (WD)", value=False, help="Adjust forecasts using working days")
+
+
 # how many months to look back for item mix when allocating group → itemcodes
 ALLOC_LOOKBACK_MONTHS = 3
 
@@ -112,16 +115,208 @@ exports = prep["exports"]
 latest = exports["latest_actual_month"]
 next_m = exports["next_forecast_month"]
 
+# --- Working Days caption (sheet if present, else auto Mon–Fri) ---
+wd_meta = exports.get("wd_meta")
+if wd_meta:
+    wd_days = int(wd_meta.get("next_days", 0))
+    wd_source = wd_meta.get("wd_source", "sheet/auto")
+else:
+    p = pd.Period(next_m, "M")
+    wd_days = len(pd.date_range(p.start_time, p.end_time, freq="B"))
+    wd_source = "auto (Mon–Fri)"
+st.caption(f"Working Days for {next_m}: {wd_days} days • Source: {wd_source}")
+
+# --- Switch data source when WD toggle is ON + show Δ vs classic ---
+if use_wd:
+    import pandas as pd
+
+    # 0) Snapshot classic (non-WD) NEXT tables the first time WD is turned on
+    if "classic_snapshot" not in st.session_state:
+        st.session_state["classic_snapshot"] = {
+            "opt1_base": exports.get("opt1_next_baseline_long", pd.DataFrame()).copy(),
+            "opt1_cal":  exports.get("opt1_next_ml_calibrated_long", pd.DataFrame()).copy(),
+            "opt2_base": exports.get("opt2_next_baseline_long", pd.DataFrame()).copy(),
+            "opt2_cal":  exports.get("opt2_next_ml_calibrated_long", pd.DataFrame()).copy(),
+        }
+    snap = st.session_state["classic_snapshot"]
+
+    # 1) Option 1 (Items/Groups): use GROUP-level WD tables to avoid allocator merge issues
+    if "wd_groups_next" in exports:
+        g = exports["wd_groups_next"].copy()
+
+        # Baseline from WD
+        exports["opt1_next_baseline_long"] = (
+            g[["Month_ym", "Group", "Forecast_qty_WD_baseline"]]
+              .rename(columns={"Forecast_qty_WD_baseline": "Forecast_qty"})
+              .assign(Source="wd_baseline_rate_x_days")
+        )
+
+        # ML (prefer WD-calibrated totals if available; else fall back to classic-calibrated)
+        col = (
+            "Forecast_qty_WD_HW_calibrated_to_WD"
+            if "Forecast_qty_WD_HW_calibrated_to_WD" in g.columns
+            else "Forecast_qty_WD_HW_calibrated"
+        )
+        label = (
+            "wd_hw_rate_x_days+calibrated_to_WD_baseline"
+            if col.endswith("_to_WD")
+            else "wd_hw_rate_x_days+calibrated_to_classic_baseline"
+        )
+        exports["opt1_next_ml_calibrated_long"] = (
+            g[["Month_ym", "Group", col]]
+              .rename(columns={col: "Forecast_qty"})
+              .assign(Source=label)
+        )
+
+
+
+    # 2) Option 2 (Customers): WD versions are already in long format
+    if ("wd_opt2_next_baseline_long" in exports) and ("wd_opt2_next_calibrated_long" in exports):
+        exports["opt2_next_baseline_long"]    = exports["wd_opt2_next_baseline_long"]
+        exports["opt2_next_ml_calibrated_long"] = exports["wd_opt2_next_calibrated_long"]
+
+    # 3) Show totals Δ vs classic (ML variants)
+    def _tot(df: pd.DataFrame):
+        return int(df["Forecast_qty"].sum()) if isinstance(df, pd.DataFrame) and "Forecast_qty" in df.columns and len(df) else None
+
+    t1_wd = _tot(exports.get("opt1_next_ml_calibrated_long", pd.DataFrame()))
+    t1_cl = _tot(snap.get("opt1_cal", pd.DataFrame()))
+    if t1_wd is not None and t1_cl is not None:
+        d  = t1_wd - t1_cl
+        p  = (d / t1_cl * 100.0) if t1_cl else 0.0
+        st.caption(f"Δ vs classic (Items/Groups, ML): {d:+,} ({p:+.2f}%)")
+
+    t2_wd = _tot(exports.get("opt2_next_ml_calibrated_long", pd.DataFrame()))
+    t2_cl = _tot(snap.get("opt2_cal", pd.DataFrame()))
+    if t2_wd is not None and t2_cl is not None:
+        d  = t2_wd - t2_cl
+        p  = (d / t2_cl * 100.0) if t2_cl else 0.0
+        st.caption(f"Δ vs classic (Customers, ML): {d:+,} ({p:+.2f}%)")
+
+    with st.expander("What does ‘Use Working Days (WD)’ change?"):
+        st.markdown(
+        """
+- **When OFF:** forecasts are computed on **monthly totals** (classic).
+- **When ON:** we convert history to **rates** (Qty ÷ Working Days), forecast rates (Seasonal-Naive + Holt-Winters), then convert **back to totals** with    **next month’s Working Days**.
+- **Calibration rule stays the same:** the ML forecast is calibrated to the **baseline** total. With WD ON, it’s calibrated to the **WD baseline** total so totals reflect fewer/more days.
+- **Source of days:** uses the **‘Working Days’** sheet if present; otherwise **Mon–Fri (no holidays)** is auto-computed.
+- **Why this helps:** when demand scales with business days, WD reduces calendar effects and can improve accuracy (often a small gain, ~1–3 WAPE points).
+        """
+        )
+
+
+    # 4) Per-row Δ / Δ% vs classic for Items/Groups (ML table)
+    # We enrich the WD table in-place so your existing table render shows these columns.
+    try:
+        import pandas as pd
+        df_wd = exports.get("opt1_next_ml_calibrated_long")
+        df_cl = snap.get("opt1_cal")
+        if isinstance(df_wd, pd.DataFrame) and isinstance(df_cl, pd.DataFrame) and not df_wd.empty and not df_cl.empty:
+            base = df_cl[["Group", "Forecast_qty"]].rename(columns={"Forecast_qty": "Forecast_qty_classic"})
+            df = df_wd.merge(base, on="Group", how="left")
+            df["Δ"] = df["Forecast_qty"] - df["Forecast_qty_classic"].fillna(0).astype(int)
+            den = df["Forecast_qty_classic"].replace({0: pd.NA})
+            df["Δ%"] = ((df["Δ"] / den) * 100).round(2).fillna(0.0)
+            exports["opt1_next_ml_calibrated_long"] = df
+    except Exception:
+        pass
+
+    # 5) WD backtest (baseline only) — WAPE classic vs WD (Mon–Fri days)
+    try:
+        import pandas as pd, numpy as np
+        from notebook_exports import ensure_month_index
+
+        # Training totals per month x group (classic)
+        T = ensure_month_index(exports["opt1_train_wide"].copy())
+
+        # Working days per month (Mon–Fri) for the same months
+        months = T.index.astype(str)
+        days = pd.Series(
+            [len(pd.date_range(pd.Period(m, "M").start_time, pd.Period(m, "M").end_time, freq="B")) for m in months],
+            index=months, name="Days"
+        )
+
+        # Rates = totals / days
+        R = T.div(days, axis=0)
+
+        # Seasonal-naive backtest: predict month m using m-12
+        T_hat_classic = T.shift(12)            # classic totals
+        T_hat_wd      = R.shift(12).mul(days, axis=0)  # rate(m-12) * days(m)
+
+        # Drop the first 12 months (no forecast target)
+        Y = T.iloc[12:]
+        C = T_hat_classic.iloc[12:].reindex_like(Y).fillna(0.0)
+        W = T_hat_wd.iloc[12:].reindex_like(Y).fillna(0.0)
+
+        # Aggregate across all series and months
+        err_c = (Y - C).abs().to_numpy().sum()
+        err_w = (Y - W).abs().to_numpy().sum()
+        denom = Y.to_numpy().sum()
+
+        if denom > 0:
+            wape_c = 100.0 * err_c / denom
+            wape_w = 100.0 * err_w / denom
+            delta  = wape_w - wape_c
+            st.caption(f"WAPE backtest (Seasonal-Naive baseline): classic {wape_c:.2f}% → WD {wape_w:.2f}% ({delta:+.2f} pts)")
+    except Exception:
+        # Keep UI resilient if backtest cannot be computed
+        pass
+
+
+
 # --- Route to the right view getter ---
 if view.startswith("Product Demand"):
     if level == "Itemcodes (allocated)":
         v_alloc = get_itemcodes_allocated_view(
-            mode, exports, lookback_months=ALLOC_LOOKBACK_MONTHS
+            mode=mode,
+            exports=exports,
+            lookback_months=ALLOC_LOOKBACK_MONTHS,
         )
+
+        # --- Per-Itemcode Δ / Δ% vs classic when WD is ON ---
+        if use_wd and "classic_snapshot" in st.session_state:
+            try:
+                import pandas as pd
+
+                # Classic (non-WD) snapshot captured earlier in the WD toggle block
+                snap = st.session_state["classic_snapshot"]
+
+                # Build classic allocated items for the SAME mode (baseline or ml_calibrated)
+                classic_tmp = dict(exports)  # shallow copy
+                classic_tmp["opt1_next_baseline_long"]      = snap.get("opt1_base")
+                classic_tmp["opt1_next_ml_calibrated_long"] = snap.get("opt1_cal")
+
+                v_classic = get_itemcodes_allocated_view(
+                    mode=mode,
+                    exports=classic_tmp,
+                    lookback_months=ALLOC_LOOKBACK_MONTHS,
+                )
+
+                # Merge WD vs classic at itemcode level
+                df_wd = v_alloc["next_forecast_long"].copy()
+                df_cl = (
+                    v_classic["next_forecast_long"][["Group", "Itemcode", "Forecast_qty"]]
+                    .rename(columns={"Forecast_qty": "Forecast_qty_classic"})
+                )
+
+                df = df_wd.merge(df_cl, on=["Group", "Itemcode"], how="left")
+                df["Δ"] = df["Forecast_qty"] - df["Forecast_qty_classic"].fillna(0).astype(int)
+                den = df["Forecast_qty_classic"].replace({0: pd.NA})
+                df["Δ%"] = ((df["Δ"] / den) * 100).round(2).fillna(0.0)
+
+                # Replace the table the app renders
+                v_alloc["next_forecast_long"] = df
+            except Exception:
+                # Keep UI resilient even if delta calc fails
+                st.caption("Δ columns unavailable for Itemcodes (classic comparison failed).")
+
     else:
         v = get_items_view(mode, exports)
 else:
     v = get_customers_view(mode, exports)
+
+ 
+
 
 
 # --- Header stats ---

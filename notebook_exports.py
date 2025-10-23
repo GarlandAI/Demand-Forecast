@@ -13,6 +13,25 @@ import numpy as np
 import pandas as pd
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
+# --- Working Days helpers (sheet-or-auto) ---
+import pandas as pd  # usually already imported; harmless if duplicated
+
+def _to_month_ym(s):
+    """Normalize ANY month strings like '2025-1' → '2025-01' (YYYY-MM)."""
+    return pd.PeriodIndex(pd.Series(s).astype(str), freq="M").astype(str)
+
+def _auto_working_days_from_range(start_ym: str, end_ym: str) -> pd.DataFrame:
+    """Mon–Fri working days per month from start_ym..end_ym (inclusive)."""
+    months = pd.period_range(start_ym, end_ym, freq="M")
+    rows = []
+    for m in months:
+        p = pd.Period(m, "M")
+        # count business days using pandas only (no numpy dependency)
+        days = len(pd.date_range(p.start_time, p.end_time, freq="B"))
+        rows.append((str(m), days))
+    return pd.DataFrame(rows, columns=["Month_ym", "Days"])
+
+
 # -----------------------------
 # Loading & cleaning
 # -----------------------------
@@ -205,6 +224,225 @@ def forecaster_holt_winters(train: pd.DataFrame, target_month: str,
             out[col] = float(y.iloc[-1]) if len(y) else 0.0
     return pd.Series(out, index=train.columns)
 
+def _attach_wd_forecasts(bundle, fact, file_path):
+    """
+    Build WD-adjusted forecasts for Option 1 (Groups):
+    - compute Rates (qty / working-days),
+    - forecast next-month Rates (seasonal-naive + Holt–Winters),
+    - convert back to totals with next-month WD,
+    - calibrate HW totals to (a) classic baseline total and (b) WD baseline total,
+    - allocate to Itemcodes using existing share logic.
+    Returns the augmented bundle.
+    """
+    import pandas as pd, numpy as np
+
+    series_key = "Group"
+    mn = str(fact["Month_ym"].min())
+    mx = str(fact["Month_ym"].max())
+    next_m = str(pd.Period(mx, "M") + 1)
+
+    # --- Working days map for full range (sheet if present, else auto; fill any gaps)
+    wd_map = {}
+    try:
+        xl = pd.ExcelFile(file_path)
+        if "Working Days" in xl.sheet_names:
+            wd_raw = pd.read_excel(file_path, sheet_name="Working Days")
+            wd = (wd_raw.rename(columns={"Month":"Month_ym","month":"Month_ym",
+                                         "Days":"Days","days":"Days"})[["Month_ym","Days"]]
+                        .dropna())
+            wd["Month_ym"] = _to_month_ym(wd["Month_ym"])
+            wd["Days"] = wd["Days"].astype(int)
+            wd_map = dict(zip(wd["Month_ym"], wd["Days"]))
+    except Exception:
+        pass
+
+    auto_full  = _auto_working_days_from_range(mn, mx).set_index("Month_ym")
+    sheet_part = (pd.DataFrame(list(wd_map.items()), columns=["Month_ym","Days"])
+                    .set_index("Month_ym")) if wd_map else pd.DataFrame(columns=["Days"])
+    wd_full = auto_full.combine_first(sheet_part).reset_index()
+    wd_map  = dict(zip(wd_full["Month_ym"], wd_full["Days"]))
+    next_days = int(wd_map.get(next_m, _auto_working_days_from_range(next_m, next_m).iloc[0]["Days"]))
+
+    # --- Monthly totals & rates per group
+    monthly = (fact.groupby(["Month_ym", series_key], as_index=False)["Quantity"].sum()
+                    .rename(columns={"Quantity":"Qty"}))
+    monthly["Days"] = monthly["Month_ym"].map(wd_map)
+    monthly["Rate"] = monthly["Qty"] / monthly["Days"]
+
+    # Wide matrices (Totals and Rates)
+    qty_wide  = monthly.pivot(index="Month_ym", columns=series_key, values="Qty").fillna(0.0)
+    rate_wide = monthly.pivot(index="Month_ym", columns=series_key, values="Rate").fillna(0.0)
+    qty_wide  = ensure_month_index(qty_wide)
+    rate_wide = ensure_month_index(rate_wide)
+
+    # --- Forecasts at RATE level
+    baseline_rate = seasonal_naive_next(rate_wide, next_m)     # Series indexed by group
+    hw_rate       = forecaster_holt_winters(rate_wide, next_m) # Series indexed by group
+
+    # Convert back to totals with next month's WD
+    wd_baseline_qty = (baseline_rate * next_days).round().astype(int).rename("Forecast_qty").reset_index()
+    wd_baseline_qty.insert(0, "Month_ym", next_m)
+
+    wd_hw_qty_float = hw_rate * next_days
+
+    # --- Calibrate WD HW to the classic (non-WD) baseline total
+    target_total = int(bundle["opt1_next_baseline_long"]["Forecast_qty"].sum())
+    curr_total   = float(wd_hw_qty_float.sum())
+    scale = (target_total / curr_total) if curr_total > 0 else 1.0
+
+    scaled = wd_hw_qty_float.values * scale
+    base = np.floor(scaled).astype(int)
+    residue = target_total - int(base.sum())
+    if residue != 0:
+        frac = scaled - base
+        order = np.argsort(-frac) if residue > 0 else np.argsort(frac)
+        for i in order[:abs(residue)]:
+            base[i] += 1 if residue > 0 else -1
+    wd_hw_cal = pd.DataFrame({series_key: hw_rate.index, "Forecast_qty": base})
+    wd_hw_cal.insert(0, "Month_ym", next_m)
+
+    # --- Alternative calibration: match WD baseline total (used when WD toggle = ON)
+    target_total_wd = int(wd_baseline_qty["Forecast_qty"].sum())
+    scale_wd = (target_total_wd / curr_total) if curr_total > 0 else 1.0
+
+    scaled_wd  = wd_hw_qty_float.values * scale_wd
+    base_wd    = np.floor(scaled_wd).astype(int)
+    residue_wd = target_total_wd - int(base_wd.sum())
+    if residue_wd != 0:
+        frac  = scaled_wd - base_wd
+        order = np.argsort(-frac) if residue_wd > 0 else np.argsort(frac)
+        for i in order[:abs(residue_wd)]:
+            base_wd[i] += 1 if residue_wd > 0 else -1
+    wd_hw_cal_wd = pd.DataFrame({series_key: hw_rate.index, "Forecast_qty": base_wd})
+    wd_hw_cal_wd.insert(0, "Month_ym", next_m)
+
+    # --- Allocate to Itemcodes using existing logic
+    tmp1 = dict(bundle)
+    tmp1["opt1_next_baseline_long"]      = wd_baseline_qty.copy()
+    tmp1["opt1_next_ml_calibrated_long"] = wd_hw_cal.copy()
+    alloc_wd_baseline = get_itemcodes_allocated_view(mode="baseline",      exports=tmp1)
+    alloc_wd_cal      = get_itemcodes_allocated_view(mode="ml_calibrated", exports=tmp1)
+
+    tmp2 = dict(bundle)
+    tmp2["opt1_next_baseline_long"]      = wd_baseline_qty.copy()
+    tmp2["opt1_next_ml_calibrated_long"] = wd_hw_cal_wd.copy()
+    alloc_wd_cal_wd  = get_itemcodes_allocated_view(mode="ml_calibrated", exports=tmp2)
+
+    # --- Save outputs into bundle
+    bundle["wd_groups_next"] = (
+        wd_baseline_qty.rename(columns={"Forecast_qty":"Forecast_qty_WD_baseline"})
+        .merge(
+            wd_hw_cal.rename(columns={"Forecast_qty":"Forecast_qty_WD_HW_calibrated"}),
+            on=["Month_ym", series_key],
+            how="left"
+        )
+        .merge(
+            wd_hw_cal_wd.rename(columns={"Forecast_qty":"Forecast_qty_WD_HW_calibrated_to_WD"}),
+            on=["Month_ym", series_key],
+            how="left"
+        )
+    )
+    bundle["wd_next_baseline_long"]        = alloc_wd_baseline["next_forecast_long"]
+    bundle["wd_next_calibrated_long"]      = alloc_wd_cal["next_forecast_long"]
+    bundle["wd_next_calibrated_to_wd_long"]= alloc_wd_cal_wd["next_forecast_long"]
+
+    # keep/meta nits
+    bundle.setdefault("wd_meta", {})
+    bundle["wd_meta"].update({"next_month": next_m, "next_days": int(next_days)})
+
+    return bundle
+
+
+
+def _attach_opt2_wd_forecasts(bundle, file_path):
+    """
+    Build WD-adjusted forecasts for Option 2 (Customer Groups).
+    Uses opt2_train_wide (totals), converts to rates via working days (sheet if present, else Mon–Fri),
+    forecasts next-month rates (seasonal-naive + Holt–Winters), converts back to totals with next-month WD,
+    calibrates HW totals to the classic (non-WD) Option-2 baseline total, and stores results.
+    """
+    import pandas as pd, numpy as np
+
+    # If Option 2 isn't present, nothing to do
+    if "opt2_train_wide" not in bundle or "opt2_next_baseline_long" not in bundle:
+        return bundle
+
+    # Detect series key label from existing long format (e.g., "Customer Group")
+    series2_key = [c for c in bundle["opt2_next_baseline_long"].columns
+                   if c not in ["Month_ym", "Forecast_qty", "Source"]][0]
+
+    # Training totals (months x customers) and month range
+    train2 = ensure_month_index(bundle["opt2_train_wide"].copy())
+    months = train2.index.astype(str)
+    mn, mx = months.min(), months.max()
+
+    # Next month & WD meta
+    wd_meta  = bundle.get("wd_meta", {})
+    next_m   = wd_meta.get("next_month", str(pd.Period(mx, "M") + 1))
+    next_days = int(wd_meta.get("next_days", len(pd.date_range(pd.Period(next_m, "M").start_time,
+                                                              pd.Period(next_m, "M").end_time, freq="B"))))
+
+    # --- Working days map for full range (sheet if present, else auto; fill any gaps)
+    wd_map = {}
+    try:
+        xl = pd.ExcelFile(file_path)
+        if "Working Days" in xl.sheet_names:
+            wd_raw = pd.read_excel(file_path, sheet_name="Working Days")
+            wd = (wd_raw.rename(columns={"Month":"Month_ym","month":"Month_ym",
+                                         "Days":"Days","days":"Days"})[["Month_ym","Days"]]
+                        .dropna())
+            wd["Month_ym"] = _to_month_ym(wd["Month_ym"])
+            wd["Days"] = wd["Days"].astype(int)
+            wd_map = dict(zip(wd["Month_ym"], wd["Days"]))
+    except Exception:
+        pass
+
+    auto_full  = _auto_working_days_from_range(mn, mx).set_index("Month_ym")
+    sheet_part = (pd.DataFrame(list(wd_map.items()), columns=["Month_ym","Days"])
+                    .set_index("Month_ym")) if wd_map else pd.DataFrame(columns=["Days"])
+    wd_full = auto_full.combine_first(sheet_part).reset_index()
+    wd_map  = dict(zip(wd_full["Month_ym"], wd_full["Days"]))
+
+    # Historical rates = totals / WD
+    days_s = pd.Series([wd_map[m] for m in months], index=months, name="Days")
+    rate_wide_opt2 = train2.div(days_s, axis=0)
+
+    # Forecast rates, then convert back to totals with next month WD
+    baseline_rate2 = seasonal_naive_next(rate_wide_opt2, next_m)    # Series indexed by customer
+    hw_rate2       = forecaster_holt_winters(rate_wide_opt2, next_m)
+
+    wd2_baseline_long = (baseline_rate2 * next_days).round().astype(int).rename("Forecast_qty").reset_index()
+    if "index" in wd2_baseline_long.columns:
+        wd2_baseline_long = wd2_baseline_long.rename(columns={"index": series2_key})
+    wd2_baseline_long.insert(0, "Month_ym", next_m)
+    wd2_baseline_long["Source"] = "wd_baseline_rate_x_days"
+
+    # Calibrate WD HW totals to classic (non-WD) Option-2 baseline total
+    wd2_hw_float = hw_rate2 * next_days
+    target2 = int(bundle["opt2_next_baseline_long"]["Forecast_qty"].sum())
+    curr2   = float(wd2_hw_float.sum())
+    scale2  = (target2 / curr2) if curr2 > 0 else 1.0
+
+    scaled  = wd2_hw_float.values * scale2
+    base    = np.floor(scaled).astype(int)
+    residue = target2 - int(base.sum())
+    if residue != 0:
+        frac  = scaled - base
+        order = np.argsort(-frac) if residue > 0 else np.argsort(frac)
+        base[order[:abs(residue)]] += 1 if residue > 0 else -1
+
+    wd2_hw_cal_long = (pd.DataFrame({series2_key: hw_rate2.index, "Forecast_qty": base})
+                        .assign(Month_ym=next_m, Source="wd_hw_rate_x_days+calibrated_to_classic_baseline")
+                        .loc[:, ["Month_ym", series2_key, "Forecast_qty", "Source"]])
+
+    # Save in bundle (for app toggle)
+    bundle["wd_opt2_next_baseline_long"]   = wd2_baseline_long
+    bundle["wd_opt2_next_calibrated_long"] = wd2_hw_cal_long
+
+    return bundle
+
+
+
 
 def _opt1_tables_from_fact(fact: pd.DataFrame):
     opt1_long = (
@@ -387,6 +625,8 @@ def _attach_ml_and_calibration(bundle: Dict[str, pd.DataFrame]) -> Dict[str, pd.
 # -----------------------------
 # Public API for Streamlit
 # -----------------------------
+# Public API for Streamlit
+# -----------------------------
 def prepare_from_excel(file_path):
     """
     One-call: load → normalize Base → build export bundle (baseline + ML + calibrated).
@@ -395,9 +635,51 @@ def prepare_from_excel(file_path):
     sheets = load_sheets(file_path)
     norm = normalize_base_to_fact(sheets["Base"])
     fact = norm["FACT"]
+
     bundle = build_export_bundle_from_fact(fact)
     bundle = _attach_ml_and_calibration(bundle)
     bundle["fact"] = fact[["Month_ym", "Group", "Itemcode", "Quantity"]].copy()
+    bundle = _attach_wd_forecasts(bundle, fact, file_path)
+    bundle = _attach_opt2_wd_forecasts(bundle, file_path)
+
+
+    # --- WD meta (sheet-or-auto) for UI caption & toggle readiness ---
+    # next month after last actual
+    next_m = str(pd.Period(fact["Month_ym"].max(), "M") + 1)
+
+    # try sheet; else auto Mon–Fri
+    wd_source = "auto"
+    wd_map = {}
+    try:
+        xl = pd.ExcelFile(file_path)
+        if "Working Days" in xl.sheet_names:
+            wd_raw = pd.read_excel(file_path, sheet_name="Working Days")
+            wd = (
+                wd_raw.rename(columns={"Month": "Month_ym", "month": "Month_ym",
+                                       "Days": "Days", "days": "Days"})[["Month_ym", "Days"]]
+                   .dropna()
+            )
+            wd["Month_ym"] = _to_month_ym(wd["Month_ym"])
+            wd["Days"] = wd["Days"].astype(int)
+            wd_map = dict(zip(wd["Month_ym"], wd["Days"]))
+            wd_source = "sheet"
+    except Exception:
+        # keep auto fallback
+        pass
+
+    # days for the next forecast month
+    if next_m in wd_map:
+        next_days = int(wd_map[next_m])
+    else:
+        next_days = int(_auto_working_days_from_range(next_m, next_m).iloc[0]["Days"])
+
+    bundle["wd_meta"] = {
+        "wd_source": wd_source,
+        "range_min": str(fact["Month_ym"].min()),
+        "range_max": str(fact["Month_ym"].max()),
+        "next_month": next_m,
+        "next_days": next_days,
+    }
 
     return {
         "sheets": sheets,
@@ -406,6 +688,7 @@ def prepare_from_excel(file_path):
         "base_sop": norm["Base_SOP"],
         "exports": bundle,
     }
+
 
 APP_LABELS = {
     "items_title": "Product Demand — Item Groups (Recommended)",

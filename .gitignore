@@ -1,23 +1,21 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# Jupyter checkpoints (any folder)
+**/.ipynb_checkpoints/
+
+# Python bytecode
+**/__pycache__/
+
+# Local data (don’t push raw files)
+data/
+
+# Raw files anywhere (your Jan–Aug_ SOP…xlsx, CSV exports, etc.)
+*.xlsx
+*.csv
+
+# Local secrets (if you add them later)
+.streamlit/secrets.toml
+
+# Misc local clutter
+.env
 .venv/
-env/
-venv/
-*.egg-info/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# OS / editors
 .DS_Store
 Thumbs.db
-.vscode/
-.idea/
-
-# Data (keep client files private)
-data/
-*.xlsx
-!data/README.md
