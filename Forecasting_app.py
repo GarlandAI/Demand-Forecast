@@ -25,7 +25,7 @@ def _cached_prepare_from_excel(file_obj):
     return prepare_from_excel(file_obj)
 
 
-st.set_page_config(page_title="Demand Forecasting Portal", layout="wide")
+st.set_page_config(page_title="Demand Forecasting Portal - Created By Garland AI", layout="wide")
 st.title("Demand Forecasting Portal")
 st.caption("Monthly forecasts by product or customer from a single Excel file")
 
