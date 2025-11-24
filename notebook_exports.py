@@ -32,6 +32,49 @@ def _auto_working_days_from_range(start_ym: str, end_ym: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["Month_ym", "Days"])
 
 
+import re
+
+def standardize_customer_group(name: str) -> str:
+    """
+    Standardize 'Customer Group' using the client-provided mapping file
+    (Customer_group_standardized_phase3.xlsx).
+    """
+    if pd.isna(name):
+        return None
+
+    # --- normalize the raw name ---
+    raw = str(name).strip()
+
+    # lazy-load the mapping once
+    global _CLIENT_MAPPING
+    if "_CLIENT_MAPPING" not in globals():
+        import os
+        base_dir = os.path.dirname(__file__)
+        map_path = os.path.join(base_dir, "Customer_group_standardized_phase3.xlsx")
+        df_map = pd.read_excel(map_path)
+        # normalize both sides
+        df_map["Raw_Customer_Group"] = df_map["Raw_Customer_Group"].astype(str).str.strip().str.upper()
+        df_map["Standard_Customer_Group"] = df_map["Standard_Customer_Group"].astype(str).str.strip()
+        _CLIENT_MAPPING = dict(zip(df_map["Raw_Customer_Group"], df_map["Standard_Customer_Group"]))
+
+    # try exact uppercase match
+    key = raw.upper()
+    if key in _CLIENT_MAPPING:
+        return _CLIENT_MAPPING[key]
+
+    # fallback: generic cleanup (remove parentheses, extra spaces, punctuation)
+    import re
+    simple = re.sub(r'[^A-Z0-9&% ]', ' ', key)
+    simple = re.sub(r'\s+', ' ', simple).strip()
+    if simple in _CLIENT_MAPPING:
+        return _CLIENT_MAPPING[simple]
+
+    # last resort: return normalized string itself
+    return simple
+
+
+
+
 # -----------------------------
 # Loading & cleaning
 # -----------------------------
@@ -146,12 +189,17 @@ def normalize_base_to_fact(base_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     b_actuals.loc[miss_mask, "Group"] = b_actuals.loc[miss_mask, "Itemcode"].map(dom_group)
     b_actuals["Group"] = b_actuals["Group"].fillna("Group Unknown")
 
-    # Standardize keys
+        # Standardize keys
     b_actuals["Itemcode"] = b_actuals["Itemcode"].astype(str).str.strip()
     b_actuals["Group"] = b_actuals["Group"].astype(str).str.strip()
-    b_actuals["Customer Group"] = b_actuals["Customer Group"].astype(str).str.strip()
+
+    if "Customer Group" in b_actuals.columns:
+        # Use our global standardization logic
+        b_actuals["Customer Group"] = b_actuals["Customer Group"].apply(standardize_customer_group)
+
     b_actuals["Month_ym"] = pd.PeriodIndex(b_actuals["Month_ym"], freq="M").astype(str)
     b_actuals["Quantity"] = pd.to_numeric(b_actuals["Quantity"], errors="coerce").fillna(0)
+
 
     fact = b_actuals[["Month_ym", "Quantity", "Itemcode", "Group", "Customer Group"]].copy()
     return {"FACT": fact, "Base_actuals": b_actuals, "Base_SOP": b_sop}
@@ -482,20 +530,54 @@ def _latest_and_next(fact: pd.DataFrame):
     return str(latest), str(latest + 1)
 
 def build_export_bundle_from_fact(fact: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    # Wide pivot tables for Option 1 (Group) and Option 2 (Customer Group)
     opt1_wide, _ = _opt1_tables_from_fact(fact)
     opt2_wide, _ = _opt2_tables_from_fact(fact)
 
+    # Latest actual month and next forecast month
     latest_m, next_m = _latest_and_next(fact)
 
+    # Training data up to the latest actual month
     opt1_train = opt1_wide.loc[:latest_m].copy()
     opt2_train = opt2_wide.loc[:latest_m].copy()
 
-    opt1_next = seasonal_naive_next(opt1_train, next_m, season=12).rename("Forecast_qty").reset_index()
+    # ---------------------------------------------------------
+    # Drop truly NEW customers for Option 2 (Customer Group)
+    # A "new" customer here = zero volume in all previous months,
+    # and > 0 in the latest month.
+    # This prevents these new groups from inflating WAPE.
+    # ---------------------------------------------------------
+    if opt2_train.shape[0] >= 2:
+        # All months before the latest
+        before_latest = opt2_train.iloc[:-1]
+        # Latest month row
+        latest_row = opt2_train.iloc[-1]
+
+        # Columns where all previous months are 0 AND latest month > 0
+        new_mask = (before_latest.sum(axis=0) == 0) & (latest_row > 0)
+        new_customers = opt2_train.columns[new_mask]
+
+        # Drop these from Option 2 training (customer forecast only)
+        if len(new_customers) > 0:
+            opt2_train = opt2_train.drop(columns=new_customers)
+    # ---------------------------------------------------------
+
+    # Baseline forecast for Option 1 (Group)
+    opt1_next = (
+        seasonal_naive_next(opt1_train, next_m, season=12)
+        .rename("Forecast_qty")
+        .reset_index()
+    )
     opt1_next = opt1_next.rename(columns={"index": "Group"})
     opt1_next.insert(0, "Month_ym", next_m)
     opt1_next["Source"] = "baseline_seasonal_naive_12m"
 
-    opt2_next = seasonal_naive_next(opt2_train, next_m, season=12).rename("Forecast_qty").reset_index()
+    # Baseline forecast for Option 2 (Customer Group)
+    opt2_next = (
+        seasonal_naive_next(opt2_train, next_m, season=12)
+        .rename("Forecast_qty")
+        .reset_index()
+    )
     opt2_next = opt2_next.rename(columns={"index": "Customer Group"})
     opt2_next.insert(0, "Month_ym", next_m)
     opt2_next["Source"] = "baseline_seasonal_naive_12m"
@@ -508,6 +590,7 @@ def build_export_bundle_from_fact(fact: pd.DataFrame) -> Dict[str, pd.DataFrame]
         "opt1_next_baseline_long": opt1_next,
         "opt2_next_baseline_long": opt2_next,
     }
+
 
 # -----------------------------
 # ML build & calibration
