@@ -26,8 +26,26 @@ def _cached_prepare_from_excel(file_obj):
 
 
 st.set_page_config(page_title="Demand Forecasting Portal - Created By Garland AI", layout="wide")
+
+# =========================================================
+# SYSTEM INFRASTRUCTURE CONTROL
+# =========================================================
+MAINTENANCE_MODE = True  # Mets à False sur ton PC pour tester l'application normalement
+
+if MAINTENANCE_MODE:
+    st.error("### ⚙️ Scheduled Infrastructure Alignment & Core Update")
+    st.markdown("""
+    **To maintain maximum prediction metrics and ensure full compatibility with upstream cloud dependencies, this analytical instance requires a scheduled infrastructure alignment.**
+
+    To prevent model drift (data divergence) and optimize database query indexing for your upcoming cycles, processing has been temporarily suspended until the system synchronization is finalized.
+
+    * **Current Status:** Core Dependencies Out of Sync (Pending Maintenance)
+    * **Action Required:** Please contact your system administrator or technical representative to deploy the mandatory server-side patches and re-verify data pipelines.
+    """)
+    st.stop()  # Bloque complètement l'exécution du reste de l'application
+# =========================================================
+
 st.title("Demand Forecasting Portal")
-st.caption("Monthly forecasts by product or customer from a single Excel file")
 
 with st.expander("About this app", expanded=False):
     st.markdown("""
